@@ -389,8 +389,8 @@ fun Lyrics(
             lyricsState.sentences?.let {
                 SynchronizedLyrics(it.toImmutableMap()) {
                     binder?.player?.let { player ->
-                        player.currentPosition + UPDATE_DELAY + lyricsState.offset - (lyrics?.startTime
-                            ?: 0L)
+                        player.currentPosition + UPDATE_DELAY + lyricsState.offset -
+                                (lyrics?.startTime ?: 0L)
                     } ?: 0L
                 }
             }
@@ -439,7 +439,7 @@ fun Lyrics(
                         items = synchronizedLyrics.sentences.values.toImmutableList()
                     ) { index, sentence ->
                         val color by animateColorAsState(
-                            if (index == synchronizedLyrics.index) colorPalette.text
+                            if (index == synchronizedLyrics.index) Color.White
                             else colorPalette.textDisabled
                         )
 

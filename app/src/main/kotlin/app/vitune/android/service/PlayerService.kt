@@ -19,7 +19,6 @@ import android.media.audiofx.LoudnessEnhancer
 import android.media.audiofx.PresetReverb
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
-import android.os.Build
 import android.os.Bundle
 import android.support.v4.media.session.MediaSessionCompat
 import android.text.format.DateUtils
@@ -123,6 +122,8 @@ import app.vitune.providers.innertube.requests.player
 import app.vitune.providers.innertube.requests.searchPage
 import app.vitune.providers.innertube.utils.from
 import app.vitune.providers.sponsorblock.SponsorBlock
+import app.vitune.providers.sponsorblock.models.Action
+import app.vitune.providers.sponsorblock.models.Category
 import app.vitune.providers.sponsorblock.requests.segments
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -255,6 +256,8 @@ class PlayerService : InvincibleService(), Player.Listener, PlaybackStatsListene
 
     private val glyphInterface by lazy { GlyphInterface(applicationContext) }
 
+    private var poiTimestamp: Long? by mutableStateOf(null)
+
     override fun onBind(intent: Intent?): AndroidBinder {
         super.onBind(intent)
         return binder
@@ -337,7 +340,9 @@ class PlayerService : InvincibleService(), Player.Listener, PlaybackStatsListene
                 callback: (T) -> Unit
             ) = launch { prop.stateFlow.collectLatest { handler.post { callback(it) } } }
 
-            subscribe(AppearancePreferences.isShowingThumbnailInLockscreenProperty) { maybeShowSongCoverInLockScreen() }
+            subscribe(AppearancePreferences.isShowingThumbnailInLockscreenProperty) {
+                maybeShowSongCoverInLockScreen()
+            }
 
             subscribe(PlayerPreferences.bassBoostLevelProperty) { maybeBassBoost() }
             subscribe(PlayerPreferences.bassBoostProperty) { maybeBassBoost() }
@@ -349,7 +354,9 @@ class PlayerService : InvincibleService(), Player.Listener, PlaybackStatsListene
                 player.setPlaybackPitch(it.coerceAtLeast(0.01f))
             }
             subscribe(PlayerPreferences.queueLoopEnabledProperty) { updateRepeatMode() }
-            subscribe(PlayerPreferences.resumePlaybackWhenDeviceConnectedProperty) { maybeResumePlaybackWhenDeviceConnected() }
+            subscribe(PlayerPreferences.resumePlaybackWhenDeviceConnectedProperty) {
+                maybeResumePlaybackWhenDeviceConnected()
+            }
             subscribe(PlayerPreferences.skipSilenceProperty) { player.skipSilenceEnabled = it }
             subscribe(PlayerPreferences.speedProperty) {
                 player.setPlaybackSpeed(it.coerceAtLeast(0.01f))
@@ -492,7 +499,10 @@ class PlayerService : InvincibleService(), Player.Listener, PlaybackStatsListene
     override fun onPlayerError(error: PlaybackException) {
         super.onPlayerError(error)
 
-        if (error.findCause<InvalidResponseCodeException>()?.responseCode == 416) {
+        if (
+            error.findCause<InvalidResponseCodeException>()?.responseCode == 416 ||
+            error.findCause<VideoIdMismatchException>() != null
+        ) {
             player.pause()
             player.prepare()
             player.play()
@@ -627,7 +637,6 @@ class PlayerService : InvincibleService(), Player.Listener, PlaybackStatsListene
         }
     }
 
-    @Suppress("ReturnCount")
     private fun maybeNormalizeVolume() {
         if (!PlayerPreferences.volumeNormalization) {
             loudnessEnhancer?.enabled = false
@@ -678,31 +687,50 @@ class PlayerService : InvincibleService(), Player.Listener, PlaybackStatsListene
         }
     }
 
+    @Suppress("CyclomaticComplexMethod") // TODO: evaluate CyclomaticComplexMethod threshold
     private fun maybeSponsorBlock() {
+        poiTimestamp = null
+
         if (!PlayerPreferences.sponsorBlockEnabled) {
             sponsorBlockJob?.cancel()
             sponsorBlockJob?.invokeOnCompletion { sponsorBlockJob = null }
             return
         }
+
         sponsorBlockJob?.cancel()
         sponsorBlockJob = coroutineScope.launch {
             mediaItemState.onStart { emit(mediaItemState.value) }.collectLatest { mediaItem ->
+                poiTimestamp = null
                 val videoId = mediaItem?.mediaId
                     ?.removePrefix("https://youtube.com/watch?v=")
                     ?.takeIf { it.isNotBlank() } ?: return@collectLatest
 
                 SponsorBlock
                     .segments(videoId)
-                    ?.map { segments -> segments.sortedBy { it.start.inWholeMilliseconds } }
+                    ?.onSuccess { segments ->
+                        poiTimestamp =
+                            segments.find { it.category == Category.PoiHighlight }?.start?.inWholeMilliseconds
+                    }
+                    ?.map { segments ->
+                        segments
+                            .sortedBy { it.start.inWholeMilliseconds }
+                            .filter { it.action == Action.Skip }
+                    }
                     ?.mapCatching { segments ->
-                        suspend fun posMillis() = withContext(Dispatchers.Main) { player.currentPosition }
-                        suspend fun speed() = withContext(Dispatchers.Main) { player.playbackParameters.speed }
-                        suspend fun seek(millis: Long) = withContext(Dispatchers.Main) { player.seekTo(millis) }
+                        suspend fun posMillis() =
+                            withContext(Dispatchers.Main) { player.currentPosition }
+
+                        suspend fun speed() =
+                            withContext(Dispatchers.Main) { player.playbackParameters.speed }
+
+                        suspend fun seek(millis: Long) =
+                            withContext(Dispatchers.Main) { player.seekTo(millis) }
 
                         val ctx = currentCoroutineContext()
                         val lastSegmentEnd =
                             segments.lastOrNull()?.end?.inWholeMilliseconds ?: return@mapCatching
 
+                        @Suppress("LoopWithTooManyJumpStatements")
                         do {
                             if (lastSegmentEnd < posMillis()) {
                                 yield()
@@ -718,7 +746,7 @@ class PlayerService : InvincibleService(), Player.Listener, PlaybackStatsListene
                                 ((nextSegment.start.inWholeMilliseconds - posMillis()) / speed().toDouble()).milliseconds
                             )
 
-                            if (posMillis() !in nextSegment.start.inWholeMilliseconds..nextSegment.end.inWholeMilliseconds) {
+                            if (posMillis().milliseconds !in nextSegment.start..nextSegment.end) {
                                 // Player is not in the segment for some reason, maybe the user seeked in the meantime
                                 yield()
                                 continue
@@ -828,19 +856,23 @@ class PlayerService : InvincibleService(), Player.Listener, PlaybackStatsListene
 
     private fun sendOpenEqualizerIntent() = sendBroadcast(
         Intent(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION).apply {
-            replaceExtras(EqualizerIntentBundleAccessor.bundle {
-                audioSession = player.audioSessionId
-                packageName = packageName
-                contentType = AudioEffect.CONTENT_TYPE_MUSIC
-            })
+            replaceExtras(
+                EqualizerIntentBundleAccessor.bundle {
+                    audioSession = player.audioSessionId
+                    packageName = packageName
+                    contentType = AudioEffect.CONTENT_TYPE_MUSIC
+                }
+            )
         }
     )
 
     private fun sendCloseEqualizerIntent() = sendBroadcast(
         Intent(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION).apply {
-            replaceExtras(EqualizerIntentBundleAccessor.bundle {
-                audioSession = player.audioSessionId
-            })
+            replaceExtras(
+                EqualizerIntentBundleAccessor.bundle {
+                    audioSession = player.audioSessionId
+                }
+            )
         }
     )
 
@@ -1080,6 +1112,8 @@ class PlayerService : InvincibleService(), Player.Listener, PlaybackStatsListene
                 isInvincibilityEnabled = value
             }
 
+        val poiTimestamp get() = this@PlayerService.poiTimestamp
+
         fun setBitmapListener(listener: ((Bitmap?) -> Unit)?) = bitmapProvider.setListener(listener)
 
         @kotlin.OptIn(FlowPreview::class)
@@ -1273,6 +1307,7 @@ class PlayerService : InvincibleService(), Player.Listener, PlaybackStatsListene
             SimpleCache(directory, cacheEvictor, createDatabaseProvider(context))
         }
 
+        @Suppress("CyclomaticComplexMethod")
         fun createYouTubeDataSourceResolverFactory(
             context: Context,
             cache: Cache,
@@ -1301,7 +1336,7 @@ class PlayerService : InvincibleService(), Player.Listener, PlaybackStatsListene
             } ?: this
 
             if (
-                dataSpec.isLocal || ((chunkLength != null) && cache.isCached(
+                dataSpec.isLocal || (chunkLength != null && cache.isCached(
                     /* key = */ mediaId,
                     /* position = */ dataSpec.position,
                     /* length = */ chunkLength
